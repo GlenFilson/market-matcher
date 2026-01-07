@@ -28,12 +28,14 @@ import os
 import sys
 import json
 import sqlite3
+import time
 import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dataclasses import dataclass, asdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from sentence_transformers import SentenceTransformer
 import ollama
 
@@ -72,14 +74,35 @@ class Config:
     include_categories: list = None  # e.g., ["politics", "crypto"]
     exclude_categories: list = None  # e.g., ["sports", "weather"]
     
-    # Matching thresholds
-    cosine_similarity_threshold: float = 0.70  # Lower = more candidates, more LLM calls
+    # ==========================================================================
+    # CANDIDATE MATCHING SETTINGS
+    # ==========================================================================
+    
+    # Date proximity filter - markets must have end dates within this many days
+    # Set to None to disable
+    max_date_difference_days: int = 3
+    
+    # Embedding model (run on GPU/CPU locally)
+    # Options: "Alibaba-NLP/gte-large-en-v1.5" (best), "BAAI/bge-large-en-v1.5", "all-MiniLM-L6-v2" (fast)
+    embedding_model: str = "Alibaba-NLP/gte-large-en-v1.5"
+    
+    # Multi-pass matching thresholds
+    # A candidate is included if ANY of these conditions are met:
+    #   1. Title similarity >= title_only_threshold
+    #   2. Full text similarity >= full_text_threshold
+    #   3. Title similarity >= title_with_date_threshold AND dates within max_date_difference_days
+    title_only_threshold: float = 0.85           # High bar for title-only match
+    full_text_threshold: float = 0.78            # Medium bar for full text match
+    title_with_date_threshold: float = 0.72      # Lower bar if dates also match
+    
+    # Legacy single threshold (used if multi_pass_matching is False)
+    cosine_similarity_threshold: float = 0.70
+    multi_pass_matching: bool = True             # Enable multi-pass logic
+    
+    # ==========================================================================
     
     # LLM settings
-    # llm_model: str = "llama3.1:8b"  # Ollama model name
-    llm_model: str = "qwen2.5:7b"    
-    # Embedding model
-    embedding_model: str = "all-MiniLM-L6-v2"
+    llm_model: str = "qwen2.5:7b"  # Ollama model name
     
     # Output settings
     output_dir: str = "."
@@ -218,9 +241,19 @@ class VerifiedMatch:
 # =============================================================================
 # >>> MODIFY THIS SECTION to change what text is used for embeddings <<<
 
-def build_embedding_text_polymarket(market: PolymarketMarket) -> str:
+def build_title_text_polymarket(market: PolymarketMarket) -> str:
+    """Build title-only text for embedding"""
+    return market.title
+
+
+def build_title_text_kalshi(market: KalshiMarket) -> str:
+    """Build title-only text for embedding"""
+    return market.title
+
+
+def build_full_text_polymarket(market: PolymarketMarket) -> str:
     """
-    Construct the text that will be embedded for a Polymarket market.
+    Construct the full text that will be embedded for a Polymarket market.
     
     MODIFY THIS FUNCTION to change what information is used for matching.
     Currently includes: title, description, end_date
@@ -241,9 +274,9 @@ def build_embedding_text_polymarket(market: PolymarketMarket) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
-def build_embedding_text_kalshi(market: KalshiMarket) -> str:
+def build_full_text_kalshi(market: KalshiMarket) -> str:
     """
-    Construct the text that will be embedded for a Kalshi market.
+    Construct the full text that will be embedded for a Kalshi market.
     
     MODIFY THIS FUNCTION to change what information is used for matching.
     Currently includes: title, subtitle, rules, end_date
@@ -265,6 +298,15 @@ def build_embedding_text_kalshi(market: KalshiMarket) -> str:
     return " ".join(p for p in parts if p).strip()
 
 
+# Legacy function names for compatibility
+def build_embedding_text_polymarket(market: PolymarketMarket) -> str:
+    return build_full_text_polymarket(market)
+
+
+def build_embedding_text_kalshi(market: KalshiMarket) -> str:
+    return build_full_text_kalshi(market)
+
+
 # =============================================================================
 # API FETCHING
 # =============================================================================
@@ -276,7 +318,10 @@ def fetch_polymarket_markets() -> list[PolymarketMarket]:
     markets = []
     base_url = "https://gamma-api.polymarket.com/markets"
     offset = 0
-    limit = 100
+    limit = 500  # Increased from 100 - Gamma API supports up to 1000
+    
+    # Use session for connection reuse
+    session = requests.Session()
     
     while True:
         params = {
@@ -287,7 +332,7 @@ def fetch_polymarket_markets() -> list[PolymarketMarket]:
         }
         
         try:
-            response = requests.get(base_url, params=params, timeout=30)
+            response = session.get(base_url, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as e:
@@ -351,6 +396,7 @@ def fetch_polymarket_markets() -> list[PolymarketMarket]:
         offset += limit
         print(f"  Fetched {len(markets)} markets so far...")
     
+    session.close()
     print(f"Fetched {len(markets)} total Polymarket markets")
     return markets
 
@@ -363,16 +409,19 @@ def fetch_kalshi_markets() -> list[KalshiMarket]:
     base_url = "https://api.elections.kalshi.com/trade-api/v2/markets"
     cursor = None
     
+    # Use session for connection reuse
+    session = requests.Session()
+    
     while True:
         params = {
             "status": "open",
-            "limit": 1000,
+            "limit": 1000,  # Kalshi max is 1000
         }
         if cursor:
             params["cursor"] = cursor
         
         try:
-            response = requests.get(base_url, params=params, timeout=30)
+            response = session.get(base_url, params=params, timeout=30)
             response.raise_for_status()
             data = response.json()
         except requests.RequestException as e:
@@ -422,6 +471,7 @@ def fetch_kalshi_markets() -> list[KalshiMarket]:
             break
         print(f"  Fetched {len(markets)} markets so far...")
     
+    session.close()
     print(f"Fetched {len(markets)} total Kalshi markets")
     return markets
 
@@ -533,54 +583,177 @@ def compute_embeddings(
     poly_markets: list[PolymarketMarket],
     kalshi_markets: list[KalshiMarket],
     model_name: str
-) -> tuple[np.ndarray, np.ndarray]:
-    """Compute embeddings for all markets"""
+) -> dict:
+    """
+    Compute embeddings for all markets.
+    Returns dict with both title-only and full-text embeddings.
+    
+    Optimization: Batch all texts together for single model.encode() call
+    """
     print(f"Loading embedding model: {model_name}")
     model = SentenceTransformer(model_name)
     
     print("Building embedding texts...")
-    poly_texts = [build_embedding_text_polymarket(m) for m in poly_markets]
-    kalshi_texts = [build_embedding_text_kalshi(m) for m in kalshi_markets]
     
-    print(f"Computing embeddings for {len(poly_texts)} Polymarket markets...")
-    poly_embeddings = model.encode(poly_texts, show_progress_bar=True)
+    # Title-only texts
+    poly_titles = [build_title_text_polymarket(m) for m in poly_markets]
+    kalshi_titles = [build_title_text_kalshi(m) for m in kalshi_markets]
     
-    print(f"Computing embeddings for {len(kalshi_texts)} Kalshi markets...")
-    kalshi_embeddings = model.encode(kalshi_texts, show_progress_bar=True)
+    # Full texts (title + description + rules + date)
+    poly_full = [build_full_text_polymarket(m) for m in poly_markets]
+    kalshi_full = [build_full_text_kalshi(m) for m in kalshi_markets]
     
-    return poly_embeddings, kalshi_embeddings
+    # Batch ALL texts together for efficiency (single GPU transfer)
+    all_texts = poly_titles + kalshi_titles + poly_full + kalshi_full
+    
+    print(f"Computing embeddings for {len(all_texts)} texts in single batch...")
+    all_embeddings = model.encode(all_texts, show_progress_bar=True, batch_size=64)
+    
+    # Split back into components
+    n_poly = len(poly_markets)
+    n_kalshi = len(kalshi_markets)
+    
+    idx = 0
+    poly_title_emb = all_embeddings[idx:idx+n_poly]; idx += n_poly
+    kalshi_title_emb = all_embeddings[idx:idx+n_kalshi]; idx += n_kalshi
+    poly_full_emb = all_embeddings[idx:idx+n_poly]; idx += n_poly
+    kalshi_full_emb = all_embeddings[idx:idx+n_kalshi]; idx += n_kalshi
+    
+    return {
+        "poly_title": poly_title_emb,
+        "kalshi_title": kalshi_title_emb,
+        "poly_full": poly_full_emb,
+        "kalshi_full": kalshi_full_emb,
+    }
 
 
 def find_candidates(
     poly_markets: list[PolymarketMarket],
     kalshi_markets: list[KalshiMarket],
-    poly_embeddings: np.ndarray,
-    kalshi_embeddings: np.ndarray,
-    threshold: float
+    embeddings: dict,
+    config: Config
 ) -> list[MatchCandidate]:
-    """Find candidate pairs using cosine similarity"""
-    print(f"Computing similarity matrix ({len(poly_markets)} x {len(kalshi_markets)})...")
+    """
+    Find candidate pairs using multi-pass matching logic.
+    
+    A candidate is included if ANY of these conditions are met:
+    1. Title similarity >= title_only_threshold
+    2. Full text similarity >= full_text_threshold  
+    3. Title similarity >= title_with_date_threshold AND dates within max_date_difference_days
+    """
+    print(f"Computing similarity matrices ({len(poly_markets)} x {len(kalshi_markets)})...")
     
     # Normalize embeddings for cosine similarity
-    poly_norm = poly_embeddings / np.linalg.norm(poly_embeddings, axis=1, keepdims=True)
-    kalshi_norm = kalshi_embeddings / np.linalg.norm(kalshi_embeddings, axis=1, keepdims=True)
+    def normalize(emb):
+        return emb / np.linalg.norm(emb, axis=1, keepdims=True)
     
-    # Compute similarity matrix
-    similarity_matrix = np.dot(poly_norm, kalshi_norm.T)
+    poly_title_norm = normalize(embeddings["poly_title"])
+    kalshi_title_norm = normalize(embeddings["kalshi_title"])
+    poly_full_norm = normalize(embeddings["poly_full"])
+    kalshi_full_norm = normalize(embeddings["kalshi_full"])
     
-    # Find pairs above threshold
+    # Compute similarity matrices
+    title_sim = np.dot(poly_title_norm, kalshi_title_norm.T)
+    full_sim = np.dot(poly_full_norm, kalshi_full_norm.T)
+    
     candidates = []
-    pairs_above_threshold = np.argwhere(similarity_matrix >= threshold)
+    seen_pairs = set()
     
-    print(f"Found {len(pairs_above_threshold)} pairs above threshold {threshold}")
+    # Pre-compute date differences if needed (VECTORIZED)
+    date_diffs = None
+    if config.max_date_difference_days is not None:
+        print(f"Computing date proximity matrix (max {config.max_date_difference_days} days difference)...")
+        
+        # Extract dates as numpy arrays for vectorized computation
+        poly_dates = np.array([
+            m.end_date.timestamp() if m.end_date else np.nan 
+            for m in poly_markets
+        ])
+        kalshi_dates = np.array([
+            m.end_date.timestamp() if m.end_date else np.nan 
+            for m in kalshi_markets
+        ])
+        
+        # Compute absolute difference in days using broadcasting
+        # Shape: (n_poly, 1) - (1, n_kalshi) = (n_poly, n_kalshi)
+        date_diffs = np.abs(poly_dates[:, np.newaxis] - kalshi_dates[np.newaxis, :]) / 86400  # seconds to days
+        
+        # Set NaN (missing dates) to infinity
+        date_diffs = np.nan_to_num(date_diffs, nan=float('inf'))
     
-    for poly_idx, kalshi_idx in pairs_above_threshold:
-        similarity = similarity_matrix[poly_idx, kalshi_idx]
-        candidates.append(MatchCandidate(
-            poly_market=poly_markets[poly_idx],
-            kalshi_market=kalshi_markets[kalshi_idx],
-            cosine_similarity=float(similarity),
-        ))
+    if config.multi_pass_matching:
+        print("Using multi-pass matching:")
+        print(f"  Pass 1: Title similarity >= {config.title_only_threshold}")
+        print(f"  Pass 2: Full text similarity >= {config.full_text_threshold}")
+        print(f"  Pass 3: Title similarity >= {config.title_with_date_threshold} AND dates within {config.max_date_difference_days} days")
+        
+        # Pass 1: Title-only high threshold
+        pass1_pairs = np.argwhere(title_sim >= config.title_only_threshold)
+        print(f"  Pass 1 found: {len(pass1_pairs)} pairs")
+        for poly_idx, kalshi_idx in pass1_pairs:
+            pair_key = (poly_idx, kalshi_idx)
+            if pair_key not in seen_pairs:
+                seen_pairs.add(pair_key)
+                candidates.append(MatchCandidate(
+                    poly_market=poly_markets[poly_idx],
+                    kalshi_market=kalshi_markets[kalshi_idx],
+                    cosine_similarity=float(title_sim[poly_idx, kalshi_idx]),
+                ))
+        
+        # Pass 2: Full text medium threshold
+        pass2_pairs = np.argwhere(full_sim >= config.full_text_threshold)
+        pass2_new = 0
+        for poly_idx, kalshi_idx in pass2_pairs:
+            pair_key = (poly_idx, kalshi_idx)
+            if pair_key not in seen_pairs:
+                seen_pairs.add(pair_key)
+                pass2_new += 1
+                candidates.append(MatchCandidate(
+                    poly_market=poly_markets[poly_idx],
+                    kalshi_market=kalshi_markets[kalshi_idx],
+                    cosine_similarity=float(full_sim[poly_idx, kalshi_idx]),
+                ))
+        print(f"  Pass 2 found: {pass2_new} new pairs")
+        
+        # Pass 3: Title with date proximity
+        if date_diffs is not None:
+            title_date_mask = (title_sim >= config.title_with_date_threshold) & (date_diffs <= config.max_date_difference_days)
+            pass3_pairs = np.argwhere(title_date_mask)
+            pass3_new = 0
+            for poly_idx, kalshi_idx in pass3_pairs:
+                pair_key = (poly_idx, kalshi_idx)
+                if pair_key not in seen_pairs:
+                    seen_pairs.add(pair_key)
+                    pass3_new += 1
+                    candidates.append(MatchCandidate(
+                        poly_market=poly_markets[poly_idx],
+                        kalshi_market=kalshi_markets[kalshi_idx],
+                        cosine_similarity=float(title_sim[poly_idx, kalshi_idx]),
+                    ))
+            print(f"  Pass 3 found: {pass3_new} new pairs")
+    
+    else:
+        # Legacy single-threshold matching
+        print(f"Using single threshold: {config.cosine_similarity_threshold}")
+        pairs_above_threshold = np.argwhere(full_sim >= config.cosine_similarity_threshold)
+        
+        # Apply date filter if enabled
+        if date_diffs is not None:
+            filtered_pairs = []
+            for poly_idx, kalshi_idx in pairs_above_threshold:
+                if date_diffs[poly_idx, kalshi_idx] <= config.max_date_difference_days:
+                    filtered_pairs.append((poly_idx, kalshi_idx))
+            pairs_above_threshold = filtered_pairs
+            print(f"After date filter: {len(pairs_above_threshold)} pairs")
+        
+        for poly_idx, kalshi_idx in pairs_above_threshold:
+            candidates.append(MatchCandidate(
+                poly_market=poly_markets[poly_idx],
+                kalshi_market=kalshi_markets[kalshi_idx],
+                cosine_similarity=float(full_sim[poly_idx, kalshi_idx]),
+            ))
+    
+    print(f"Total candidates: {len(candidates)}")
     
     # Sort by similarity descending
     candidates.sort(key=lambda x: x.cosine_similarity, reverse=True)
@@ -993,13 +1166,23 @@ def main():
     print("Cross-Venue Arbitrage Market Matcher")
     print("=" * 60)
     print(f"Date range: {CONFIG.min_end_date.date()} to {CONFIG.max_end_date.date()}")
-    print(f"Cosine similarity threshold: {CONFIG.cosine_similarity_threshold}")
     print(f"Volume filters - Poly: {CONFIG.polymarket_min_volume}, Kalshi: {CONFIG.kalshi_min_volume}")
     print(f"Liquidity filters - Poly: {CONFIG.polymarket_min_liquidity}, Kalshi: {CONFIG.kalshi_min_liquidity}")
     if CONFIG.include_categories:
         print(f"Include categories: {CONFIG.include_categories}")
     if CONFIG.exclude_categories:
         print(f"Exclude categories: {CONFIG.exclude_categories}")
+    print()
+    print(f"Embedding model: {CONFIG.embedding_model}")
+    if CONFIG.multi_pass_matching:
+        print("Matching mode: Multi-pass")
+        print(f"  Title-only threshold: {CONFIG.title_only_threshold}")
+        print(f"  Full-text threshold: {CONFIG.full_text_threshold}")
+        print(f"  Title+date threshold: {CONFIG.title_with_date_threshold} (within {CONFIG.max_date_difference_days} days)")
+    else:
+        print(f"Matching mode: Single threshold ({CONFIG.cosine_similarity_threshold})")
+        if CONFIG.max_date_difference_days:
+            print(f"  Date proximity filter: {CONFIG.max_date_difference_days} days")
     print(f"LLM model: {CONFIG.llm_model}")
     if resume_mode:
         print("MODE: Resume from candidates CSV")
@@ -1019,9 +1202,17 @@ def main():
     date_str = utc_now().strftime("%Y-%m-%d")
     candidates_filepath = os.path.join(CONFIG.output_dir, f"arb_candidates_{date_str}.csv")
     
-    # Fetch markets (needed for both modes to get current prices)
-    poly_markets = fetch_polymarket_markets()
-    kalshi_markets = fetch_kalshi_markets()
+    # Fetch markets in PARALLEL (saves ~50% of fetch time)
+    print("Fetching markets from both platforms in parallel...")
+    fetch_start = time.time()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        poly_future = executor.submit(fetch_polymarket_markets)
+        kalshi_future = executor.submit(fetch_kalshi_markets)
+        
+        poly_markets = poly_future.result()
+        kalshi_markets = kalshi_future.result()
+    fetch_time = time.time() - fetch_start
+    print(f"Fetch completed in {fetch_time:.1f}s")
     print()
     
     if not poly_markets or not kalshi_markets:
@@ -1044,17 +1235,23 @@ def main():
         print(f"Loaded {len(candidates)} candidates")
     else:
         # Normal mode: compute embeddings and find candidates
-        poly_embeddings, kalshi_embeddings = compute_embeddings(
+        embed_start = time.time()
+        embeddings = compute_embeddings(
             poly_filtered, kalshi_filtered, CONFIG.embedding_model
         )
+        embed_time = time.time() - embed_start
+        print(f"Embeddings completed in {embed_time:.1f}s")
         print()
         
-        # Find candidates
+        # Find candidates using multi-pass or single threshold
+        candidate_start = time.time()
         candidates = find_candidates(
             poly_filtered, kalshi_filtered,
-            poly_embeddings, kalshi_embeddings,
-            CONFIG.cosine_similarity_threshold
+            embeddings,
+            CONFIG
         )
+        candidate_time = time.time() - candidate_start
+        print(f"Candidate finding completed in {candidate_time:.1f}s")
         print()
         
         # Save candidates CSV (pre-LLM)
