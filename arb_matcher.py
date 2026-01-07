@@ -76,8 +76,8 @@ class Config:
     cosine_similarity_threshold: float = 0.70  # Lower = more candidates, more LLM calls
     
     # LLM settings
-    llm_model: str = "llama3.1:8b"  # Ollama model name
-    
+    # llm_model: str = "llama3.1:8b"  # Ollama model name
+    llm_model: str = "qwen2.5:7b"    
     # Embedding model
     embedding_model: str = "all-MiniLM-L6-v2"
     
