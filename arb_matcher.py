@@ -51,20 +51,26 @@ class Config:
     # Date filters (markets must resolve within this window)
     min_end_date: datetime = None  # Set to None for "now"
     max_end_date: datetime = None  # Set to None for "now + 90 days"
-    days_until_max_end: int = 30   # Used if max_end_date is None
+    days_until_max_end: int = 90   # Used if max_end_date is None
     days_until_min_end: int = 1    # Used if min_end_date is None
     
     # Volume filters (minimum 24h or total volume)
-    polymarket_min_volume: int = 500
-    kalshi_min_volume: int = 500
+    polymarket_min_volume: int = 5000
+    kalshi_min_volume: int = 5000
     
     # Liquidity filters
-    polymarket_min_liquidity: int = 1000
-    kalshi_min_liquidity: int = 1000
+    polymarket_min_liquidity: int = 5000
+    kalshi_min_liquidity: int = 5000
+    
+    # Additional Kalshi filters
+    kalshi_min_open_interest: int = 0  # Minimum open interest
+    kalshi_min_volume_24h: int = 0     # Minimum 24h volume (more recent activity)
     
     # Category filters (empty list = include all)
+    # Common Polymarket tags: "politics", "crypto", "sports", "science", "entertainment", "business"
+    # Common Kalshi categories: "Politics", "Economics", "Tech & Science", "Entertainment", "Sports", "Climate & Weather"
     include_categories: list = None  # e.g., ["politics", "crypto"]
-    exclude_categories: list = None  # e.g., ["weather"]
+    exclude_categories: list = None  # e.g., ["sports", "weather"]
     
     # Matching thresholds
     cosine_similarity_threshold: float = 0.70  # Lower = more candidates, more LLM calls
@@ -149,7 +155,9 @@ class KalshiMarket:
     no_price: float
     end_date: Optional[datetime]
     volume: float
+    volume_24h: float
     liquidity: float
+    open_interest: float
     category: str
     
     @property
@@ -181,6 +189,7 @@ class VerifiedMatch:
     poly_yes_price: float
     poly_no_price: float
     poly_end_date: str
+    poly_tags: str  # Comma-separated tags
     
     kalshi_ticker: str
     kalshi_title: str
@@ -189,6 +198,7 @@ class VerifiedMatch:
     kalshi_yes_price: float
     kalshi_no_price: float
     kalshi_end_date: str
+    kalshi_category: str
     
     cosine_similarity: float
     llm_confidence: float
@@ -397,7 +407,9 @@ def fetch_kalshi_markets() -> list[KalshiMarket]:
                     no_price=no_price,
                     end_date=end_date,
                     volume=float(m.get("volume", 0) or 0),
+                    volume_24h=float(m.get("volume_24h", 0) or 0),
                     liquidity=float(m.get("liquidity", 0) or 0),
+                    open_interest=float(m.get("open_interest", 0) or 0),
                     category=m.get("category", ""),
                 )
                 markets.append(market)
@@ -450,6 +462,16 @@ def filter_polymarket_markets(markets: list[PolymarketMarket], config: Config) -
         filtered.append(m)
     
     print(f"Filtered Polymarket: {len(markets)} -> {len(filtered)} markets")
+    
+    # Print tag summary
+    tag_counts = {}
+    for m in filtered:
+        for tag in m.tags:
+            tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    if tag_counts:
+        top_tags = sorted(tag_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        print(f"  Top Polymarket tags: {', '.join(f'{t}({c})' for t, c in top_tags)}")
+    
     return filtered
 
 
@@ -471,7 +493,15 @@ def filter_kalshi_markets(markets: list[KalshiMarket], config: Config) -> list[K
         if m.liquidity < config.kalshi_min_liquidity:
             continue
         
-        # Category filters
+        # Open interest filter
+        if m.open_interest < config.kalshi_min_open_interest:
+            continue
+        
+        # 24h volume filter
+        if m.volume_24h < config.kalshi_min_volume_24h:
+            continue
+        
+        # Category filters (case-insensitive)
         if config.include_categories:
             if m.category.lower() not in [c.lower() for c in config.include_categories]:
                 continue
@@ -483,6 +513,15 @@ def filter_kalshi_markets(markets: list[KalshiMarket], config: Config) -> list[K
         filtered.append(m)
     
     print(f"Filtered Kalshi: {len(markets)} -> {len(filtered)} markets")
+    
+    # Print category summary
+    cat_counts = {}
+    for m in filtered:
+        cat_counts[m.category] = cat_counts.get(m.category, 0) + 1
+    if cat_counts:
+        top_cats = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+        print(f"  Top Kalshi categories: {', '.join(f'{c}({n})' for c, n in top_cats)}")
+    
     return filtered
 
 
@@ -635,6 +674,9 @@ def create_verified_match(candidate: MatchCandidate, confidence: float, reasonin
     pykn = poly_yes + kalshi_no    # Buy yes poly + buy no kalshi
     kypn = kalshi_yes + poly_no    # Buy yes kalshi + buy no poly
     
+    # Format tags as comma-separated string
+    poly_tags_str = ", ".join(candidate.poly_market.tags) if candidate.poly_market.tags else ""
+    
     return VerifiedMatch(
         poly_condition_id=candidate.poly_market.condition_id,
         poly_title=candidate.poly_market.title,
@@ -643,6 +685,7 @@ def create_verified_match(candidate: MatchCandidate, confidence: float, reasonin
         poly_yes_price=poly_yes,
         poly_no_price=poly_no,
         poly_end_date=candidate.poly_market.end_date.strftime("%Y-%m-%d") if candidate.poly_market.end_date else "",
+        poly_tags=poly_tags_str,
         
         kalshi_ticker=candidate.kalshi_market.ticker,
         kalshi_title=candidate.kalshi_market.title,
@@ -651,6 +694,7 @@ def create_verified_match(candidate: MatchCandidate, confidence: float, reasonin
         kalshi_yes_price=kalshi_yes,
         kalshi_no_price=kalshi_no,
         kalshi_end_date=candidate.kalshi_market.end_date.strftime("%Y-%m-%d") if candidate.kalshi_market.end_date else "",
+        kalshi_category=candidate.kalshi_market.category,
         
         cosine_similarity=candidate.cosine_similarity,
         llm_confidence=confidence,
@@ -726,18 +770,19 @@ def save_single_match_to_db(conn: sqlite3.Connection, match: VerifiedMatch) -> b
         cursor.execute("""
             INSERT OR IGNORE INTO verified_matches (
                 poly_condition_id, kalshi_ticker, poly_title, poly_description,
-                poly_url, poly_yes_price, poly_no_price, poly_end_date, kalshi_title, kalshi_rules,
-                kalshi_url, kalshi_yes_price, kalshi_no_price, kalshi_end_date, cosine_similarity,
-                llm_confidence, llm_reasoning, price_diff_pct, match_date,
-                pypn, kykn, pykn, kypn
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                poly_url, poly_yes_price, poly_no_price, poly_end_date, poly_tags,
+                kalshi_title, kalshi_rules, kalshi_url, kalshi_yes_price, kalshi_no_price,
+                kalshi_end_date, kalshi_category, cosine_similarity, llm_confidence,
+                llm_reasoning, price_diff_pct, match_date, pypn, kykn, pykn, kypn
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             match.poly_condition_id, match.kalshi_ticker, match.poly_title,
             match.poly_description, match.poly_url, match.poly_yes_price,
-            match.poly_no_price, match.poly_end_date, match.kalshi_title, match.kalshi_rules,
-            match.kalshi_url, match.kalshi_yes_price, match.kalshi_no_price, match.kalshi_end_date,
-            match.cosine_similarity, match.llm_confidence, match.llm_reasoning,
-            match.price_diff_pct, match.match_date,
+            match.poly_no_price, match.poly_end_date, match.poly_tags,
+            match.kalshi_title, match.kalshi_rules, match.kalshi_url,
+            match.kalshi_yes_price, match.kalshi_no_price, match.kalshi_end_date,
+            match.kalshi_category, match.cosine_similarity, match.llm_confidence,
+            match.llm_reasoning, match.price_diff_pct, match.match_date,
             match.pypn, match.kykn, match.pykn, match.kypn
         ))
         conn.commit()
@@ -767,12 +812,14 @@ def init_database(db_path: str) -> sqlite3.Connection:
             poly_yes_price REAL,
             poly_no_price REAL,
             poly_end_date TEXT,
+            poly_tags TEXT,
             kalshi_title TEXT,
             kalshi_rules TEXT,
             kalshi_url TEXT,
             kalshi_yes_price REAL,
             kalshi_no_price REAL,
             kalshi_end_date TEXT,
+            kalshi_category TEXT,
             cosine_similarity REAL,
             llm_confidence REAL,
             llm_reasoning TEXT,
@@ -877,12 +924,15 @@ def save_candidates_csv(candidates: list[MatchCandidate], filepath: str):
     """Save cosine similarity candidates to CSV (pre-LLM)"""
     rows = []
     for c in candidates:
+        poly_tags_str = ", ".join(c.poly_market.tags) if c.poly_market.tags else ""
         rows.append({
             "poly_condition_id": c.poly_market.condition_id,
             "poly_title": c.poly_market.title,
+            "poly_tags": poly_tags_str,
             "poly_url": c.poly_market.url,
             "kalshi_ticker": c.kalshi_market.ticker,
             "kalshi_title": c.kalshi_market.title,
+            "kalshi_category": c.kalshi_market.category,
             "kalshi_url": c.kalshi_market.url,
             "cosine_similarity": c.cosine_similarity,
         })
@@ -944,6 +994,13 @@ def main():
     print("=" * 60)
     print(f"Date range: {CONFIG.min_end_date.date()} to {CONFIG.max_end_date.date()}")
     print(f"Cosine similarity threshold: {CONFIG.cosine_similarity_threshold}")
+    print(f"Volume filters - Poly: {CONFIG.polymarket_min_volume}, Kalshi: {CONFIG.kalshi_min_volume}")
+    print(f"Liquidity filters - Poly: {CONFIG.polymarket_min_liquidity}, Kalshi: {CONFIG.kalshi_min_liquidity}")
+    if CONFIG.include_categories:
+        print(f"Include categories: {CONFIG.include_categories}")
+    if CONFIG.exclude_categories:
+        print(f"Exclude categories: {CONFIG.exclude_categories}")
+    print(f"LLM model: {CONFIG.llm_model}")
     if resume_mode:
         print("MODE: Resume from candidates CSV")
     print()
