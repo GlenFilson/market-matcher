@@ -53,7 +53,7 @@ class Config:
     # Date filters (markets must resolve within this window)
     min_end_date: datetime = None  # Set to None for "now"
     max_end_date: datetime = None  # Set to None for "now + 90 days"
-    days_until_max_end: int = 90   # Used if max_end_date is None
+    days_until_max_end: int = 30   # Used if max_end_date is None
     days_until_min_end: int = 1    # Used if min_end_date is None
     
     # Volume filters (minimum 24h or total volume)
@@ -591,7 +591,7 @@ def compute_embeddings(
     Optimization: Batch all texts together for single model.encode() call
     """
     print(f"Loading embedding model: {model_name}")
-    model = SentenceTransformer(model_name)
+    model = SentenceTransformer(model_name, trust_remote_code=True)
     
     print("Building embedding texts...")
     
