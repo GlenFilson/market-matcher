@@ -6,7 +6,7 @@ Identifies matching prediction markets between Polymarket and Kalshi
 for potential arbitrage opportunities.
 
 Pipeline:
-1. Fetch active markets from both platforms
+1. Fetch active markets from both platforms (with caching)
 2. Apply filters (date, volume, liquidity, categories)
 3. Generate embeddings (local, sentence-transformers)
 4. Find candidate pairs via cosine similarity
@@ -15,13 +15,14 @@ Pipeline:
 7. Output CSVs
 
 Usage:
-    python arb_matcher.py
-    python arb_matcher.py --resume    # Resume from candidates CSV (skip embedding)
+    python arb_matcher.py              # Normal run (uses cache if valid)
+    python arb_matcher.py --resume     # Resume from candidates CSV (skip embedding)
+    python arb_matcher.py --fresh      # Force fresh API fetch (ignore cache)
 
 Requirements:
-    pip install requests sentence-transformers numpy pandas ollama
+    pip install requests sentence-transformers numpy pandas ollama torch
     # Also install Ollama: https://ollama.ai/download
-    # Then: ollama pull llama3.1:8b
+    # Then: ollama pull qwen2.5:7b
 """
 
 import os
@@ -29,6 +30,8 @@ import sys
 import json
 import sqlite3
 import time
+import pickle
+import subprocess
 import requests
 import numpy as np
 import pandas as pd
@@ -36,8 +39,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from dataclasses import dataclass, asdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from sentence_transformers import SentenceTransformer
 import ollama
+
+# Note: sentence_transformers and torch are imported lazily in compute_embeddings()
+# to avoid reserving GPU memory when using --resume mode
 
 
 def utc_now() -> datetime:
@@ -53,7 +58,7 @@ class Config:
     # Date filters (markets must resolve within this window)
     min_end_date: datetime = None  # Set to None for "now"
     max_end_date: datetime = None  # Set to None for "now + 90 days"
-    days_until_max_end: int = 30   # Used if max_end_date is None
+    days_until_max_end: int = 90   # Used if max_end_date is None
     days_until_min_end: int = 1    # Used if min_end_date is None
     
     # Volume filters (minimum 24h or total volume)
@@ -75,6 +80,15 @@ class Config:
     exclude_categories: list = None  # e.g., ["sports", "weather"]
     
     # ==========================================================================
+    # CACHING SETTINGS
+    # ==========================================================================
+    
+    # Cache expiry in minutes (set to 0 to disable caching)
+    # Use --fresh flag to force refetch regardless of cache age
+    cache_expiry_minutes: int = 60  # 1 hour default
+    cache_dir: str = ".cache"       # Directory for cache files
+    
+    # ==========================================================================
     # CANDIDATE MATCHING SETTINGS
     # ==========================================================================
     
@@ -85,15 +99,17 @@ class Config:
     # Embedding model (run on GPU/CPU locally)
     # Options: "Alibaba-NLP/gte-large-en-v1.5" (best), "BAAI/bge-large-en-v1.5", "all-MiniLM-L6-v2" (fast)
     embedding_model: str = "Alibaba-NLP/gte-large-en-v1.5"
+    embedding_device: str = "cpu"  # Use "cpu" - only ~15s slower but avoids GPU memory conflicts with Ollama
+    embedding_batch_size: int = 32  # Can be higher on CPU since no VRAM limit
     
     # Multi-pass matching thresholds
     # A candidate is included if ANY of these conditions are met:
     #   1. Title similarity >= title_only_threshold
     #   2. Full text similarity >= full_text_threshold
     #   3. Title similarity >= title_with_date_threshold AND dates within max_date_difference_days
-    title_only_threshold: float = 0.85           # High bar for title-only match
-    full_text_threshold: float = 0.78            # Medium bar for full text match
-    title_with_date_threshold: float = 0.72      # Lower bar if dates also match
+    title_only_threshold: float = 0.88           # High bar for title-only match
+    full_text_threshold: float = 0.85            # High bar for full text match (was 0.78, found 2750!)
+    title_with_date_threshold: float = 0.75      # Lower bar if dates also match
     
     # Legacy single threshold (used if multi_pass_matching is False)
     cosine_similarity_threshold: float = 0.70
@@ -185,7 +201,9 @@ class KalshiMarket:
     
     @property
     def url(self) -> str:
-        return f"https://kalshi.com/markets/{self.ticker}"
+        # Link to event page - more reliable than trying to construct market URL
+        # Event URL format: https://kalshi.com/events/{event_ticker}
+        return f"https://kalshi.com/events/{self.event_ticker}"
     
     @property
     def rules(self) -> str:
@@ -305,6 +323,99 @@ def build_embedding_text_polymarket(market: PolymarketMarket) -> str:
 
 def build_embedding_text_kalshi(market: KalshiMarket) -> str:
     return build_full_text_kalshi(market)
+
+
+# =============================================================================
+# MARKET CACHING
+# =============================================================================
+
+def reload_ollama_model(model: str) -> bool:
+    """
+    Reload Ollama model to ensure 100% GPU allocation.
+    Call this after freeing GPU memory from embeddings.
+    """
+    print(f"Reloading Ollama model for full GPU allocation...")
+    
+    try:
+        # Stop the model first
+        subprocess.run(["ollama", "stop", model], capture_output=True, timeout=30)
+        time.sleep(1)
+        
+        # Warm it up with a test query - this forces reload
+        result = ollama.chat(
+            model=model,
+            messages=[{"role": "user", "content": "test"}],
+            options={"num_predict": 1}  # Minimal response
+        )
+        print(f"Ollama model reloaded successfully")
+        return True
+    except Exception as e:
+        print(f"Warning: Could not reload Ollama model: {e}")
+        return False
+
+
+def stop_ollama_model(model: str) -> bool:
+    """
+    Stop Ollama model to free GPU memory for embeddings.
+    """
+    print(f"Stopping Ollama to free GPU memory for embeddings...")
+    
+    try:
+        subprocess.run(["ollama", "stop", model], capture_output=True, timeout=30)
+        time.sleep(2)  # Give it time to release memory
+        print(f"Ollama model stopped")
+        return True
+    except Exception as e:
+        print(f"Warning: Could not stop Ollama model: {e}")
+        return False
+
+def get_cache_path(cache_dir: str, platform: str) -> str:
+    """Get the cache file path for a platform"""
+    os.makedirs(cache_dir, exist_ok=True)
+    return os.path.join(cache_dir, f"{platform}_markets.pkl")
+
+
+def is_cache_valid(cache_path: str, expiry_minutes: int) -> bool:
+    """Check if cache file exists and is not expired"""
+    if not os.path.exists(cache_path):
+        return False
+    
+    if expiry_minutes <= 0:
+        return False
+    
+    cache_age = time.time() - os.path.getmtime(cache_path)
+    cache_age_minutes = cache_age / 60
+    
+    return cache_age_minutes < expiry_minutes
+
+
+def save_to_cache(cache_path: str, data: list):
+    """Save market data to cache file"""
+    with open(cache_path, 'wb') as f:
+        pickle.dump(data, f)
+
+
+def load_from_cache(cache_path: str) -> list:
+    """Load market data from cache file"""
+    with open(cache_path, 'rb') as f:
+        return pickle.load(f)
+
+
+def get_cache_age_str(cache_path: str) -> str:
+    """Get human-readable cache age"""
+    if not os.path.exists(cache_path):
+        return "no cache"
+    
+    cache_age = time.time() - os.path.getmtime(cache_path)
+    minutes = int(cache_age / 60)
+    
+    if minutes < 1:
+        return "just now"
+    elif minutes < 60:
+        return f"{minutes} min ago"
+    else:
+        hours = minutes // 60
+        return f"{hours}h {minutes % 60}m ago"
 
 
 # =============================================================================
@@ -582,7 +693,7 @@ def filter_kalshi_markets(markets: list[KalshiMarket], config: Config) -> list[K
 def compute_embeddings(
     poly_markets: list[PolymarketMarket],
     kalshi_markets: list[KalshiMarket],
-    model_name: str
+    config: Config
 ) -> dict:
     """
     Compute embeddings for all markets.
@@ -590,8 +701,12 @@ def compute_embeddings(
     
     Optimization: Batch all texts together for single model.encode() call
     """
-    print(f"Loading embedding model: {model_name}")
-    model = SentenceTransformer(model_name, trust_remote_code=True)
+    # Lazy import to avoid reserving GPU memory when using --resume
+    from sentence_transformers import SentenceTransformer
+    
+    print(f"Loading embedding model: {config.embedding_model}")
+    print(f"Embedding device: {config.embedding_device}")
+    model = SentenceTransformer(config.embedding_model, trust_remote_code=True, device=config.embedding_device)
     
     print("Building embedding texts...")
     
@@ -606,8 +721,8 @@ def compute_embeddings(
     # Batch ALL texts together for efficiency (single GPU transfer)
     all_texts = poly_titles + kalshi_titles + poly_full + kalshi_full
     
-    print(f"Computing embeddings for {len(all_texts)} texts in single batch...")
-    all_embeddings = model.encode(all_texts, show_progress_bar=True, batch_size=64)
+    print(f"Computing embeddings for {len(all_texts)} texts (batch_size={config.embedding_batch_size})...")
+    all_embeddings = model.encode(all_texts, show_progress_bar=True, batch_size=config.embedding_batch_size)
     
     # Split back into components
     n_poly = len(poly_markets)
@@ -618,6 +733,18 @@ def compute_embeddings(
     kalshi_title_emb = all_embeddings[idx:idx+n_kalshi]; idx += n_kalshi
     poly_full_emb = all_embeddings[idx:idx+n_poly]; idx += n_poly
     kalshi_full_emb = all_embeddings[idx:idx+n_kalshi]; idx += n_kalshi
+    
+    # FREE MEMORY
+    print("Freeing memory...")
+    del model
+    import gc
+    gc.collect()
+    
+    # Only clear CUDA cache if we used GPU
+    if config.embedding_device == "cuda":
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     return {
         "poly_title": poly_title_emb,
@@ -1159,8 +1286,9 @@ def load_candidates_from_csv(filepath: str, poly_markets: list[PolymarketMarket]
 
 def main():
     """Run the full matching pipeline"""
-    # Check for --resume flag
+    # Check for flags
     resume_mode = "--resume" in sys.argv
+    fresh_mode = "--fresh" in sys.argv
     
     print("=" * 60)
     print("Cross-Venue Arbitrage Market Matcher")
@@ -1174,6 +1302,7 @@ def main():
         print(f"Exclude categories: {CONFIG.exclude_categories}")
     print()
     print(f"Embedding model: {CONFIG.embedding_model}")
+    print(f"Embedding device: {CONFIG.embedding_device}")
     if CONFIG.multi_pass_matching:
         print("Matching mode: Multi-pass")
         print(f"  Title-only threshold: {CONFIG.title_only_threshold}")
@@ -1184,8 +1313,11 @@ def main():
         if CONFIG.max_date_difference_days:
             print(f"  Date proximity filter: {CONFIG.max_date_difference_days} days")
     print(f"LLM model: {CONFIG.llm_model}")
+    print(f"Cache expiry: {CONFIG.cache_expiry_minutes} minutes")
     if resume_mode:
         print("MODE: Resume from candidates CSV")
+    if fresh_mode:
+        print("MODE: Fresh fetch (ignoring cache)")
     print()
     
     # Initialize database
@@ -1202,17 +1334,56 @@ def main():
     date_str = utc_now().strftime("%Y-%m-%d")
     candidates_filepath = os.path.join(CONFIG.output_dir, f"arb_candidates_{date_str}.csv")
     
-    # Fetch markets in PARALLEL (saves ~50% of fetch time)
-    print("Fetching markets from both platforms in parallel...")
+    # Cache paths
+    poly_cache_path = get_cache_path(CONFIG.cache_dir, "polymarket")
+    kalshi_cache_path = get_cache_path(CONFIG.cache_dir, "kalshi")
+    
+    # Check cache validity
+    poly_cache_valid = not fresh_mode and is_cache_valid(poly_cache_path, CONFIG.cache_expiry_minutes)
+    kalshi_cache_valid = not fresh_mode and is_cache_valid(kalshi_cache_path, CONFIG.cache_expiry_minutes)
+    
     fetch_start = time.time()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        poly_future = executor.submit(fetch_polymarket_markets)
-        kalshi_future = executor.submit(fetch_kalshi_markets)
+    
+    # Fetch in parallel if both need refreshing, otherwise load individually
+    if not poly_cache_valid and not kalshi_cache_valid:
+        # Both need fetching - do in parallel
+        print("Fetching markets from both platforms in parallel...")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            poly_future = executor.submit(fetch_polymarket_markets)
+            kalshi_future = executor.submit(fetch_kalshi_markets)
+            
+            poly_markets = poly_future.result()
+            kalshi_markets = kalshi_future.result()
         
-        poly_markets = poly_future.result()
-        kalshi_markets = kalshi_future.result()
+        # Save to cache
+        if poly_markets:
+            save_to_cache(poly_cache_path, poly_markets)
+        if kalshi_markets:
+            save_to_cache(kalshi_cache_path, kalshi_markets)
+    else:
+        # Load or fetch individually
+        if poly_cache_valid:
+            print(f"Loading Polymarket markets from cache ({get_cache_age_str(poly_cache_path)})...")
+            poly_markets = load_from_cache(poly_cache_path)
+            print(f"Loaded {len(poly_markets)} Polymarket markets from cache")
+        else:
+            print("Fetching Polymarket markets from API...")
+            poly_markets = fetch_polymarket_markets()
+            if poly_markets:
+                save_to_cache(poly_cache_path, poly_markets)
+        
+        if kalshi_cache_valid:
+            print(f"Loading Kalshi markets from cache ({get_cache_age_str(kalshi_cache_path)})...")
+            kalshi_markets = load_from_cache(kalshi_cache_path)
+            print(f"Loaded {len(kalshi_markets)} Kalshi markets from cache")
+        else:
+            print("Fetching Kalshi markets from API...")
+            kalshi_markets = fetch_kalshi_markets()
+            if kalshi_markets:
+                save_to_cache(kalshi_cache_path, kalshi_markets)
+    
     fetch_time = time.time() - fetch_start
-    print(f"Fetch completed in {fetch_time:.1f}s")
+    print(f"Markets loaded in {fetch_time:.1f}s")
     print()
     
     if not poly_markets or not kalshi_markets:
@@ -1235,9 +1406,14 @@ def main():
         print(f"Loaded {len(candidates)} candidates")
     else:
         # Normal mode: compute embeddings and find candidates
+        
+        # Stop Ollama first to free GPU memory for embeddings
+        if CONFIG.embedding_device == "cuda":
+            stop_ollama_model(CONFIG.llm_model)
+        
         embed_start = time.time()
         embeddings = compute_embeddings(
-            poly_filtered, kalshi_filtered, CONFIG.embedding_model
+            poly_filtered, kalshi_filtered, CONFIG
         )
         embed_time = time.time() - embed_start
         print(f"Embeddings completed in {embed_time:.1f}s")
@@ -1256,6 +1432,10 @@ def main():
         
         # Save candidates CSV (pre-LLM)
         save_candidates_csv(candidates, candidates_filepath)
+        
+        # Reload Ollama to reclaim GPU memory freed from embeddings
+        if CONFIG.embedding_device == "cuda":
+            reload_ollama_model(CONFIG.llm_model)
     
     print()
     
