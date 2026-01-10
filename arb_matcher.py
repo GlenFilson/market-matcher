@@ -59,7 +59,7 @@ class Config:
     min_end_date: datetime = None  # Set to None for "now"
     max_end_date: datetime = None  # Set to None for "now + 90 days"
     days_until_max_end: int = 90   # Used if max_end_date is None
-    days_until_min_end: int = 1    # Used if min_end_date is None
+    days_until_min_end: int = 0    # Used if min_end_date is None
     
     # Volume filters (minimum 24h or total volume)
     polymarket_min_volume: int = 5000
@@ -85,7 +85,7 @@ class Config:
     
     # Cache expiry in minutes (set to 0 to disable caching)
     # Use --fresh flag to force refetch regardless of cache age
-    cache_expiry_minutes: int = 60  # 1 hour default
+    cache_expiry_minutes: int = 240  # 1 hour default
     cache_dir: str = ".cache"       # Directory for cache files
     
     # ==========================================================================
@@ -99,8 +99,9 @@ class Config:
     # Embedding model (run on GPU/CPU locally)
     # Options: "Alibaba-NLP/gte-large-en-v1.5" (best), "BAAI/bge-large-en-v1.5", "all-MiniLM-L6-v2" (fast)
     embedding_model: str = "Alibaba-NLP/gte-large-en-v1.5"
-    embedding_device: str = "cpu"  # Use "cpu" - only ~15s slower but avoids GPU memory conflicts with Ollama
-    embedding_batch_size: int = 32  # Can be higher on CPU since no VRAM limit
+    embedding_device: str = "cuda"  # "cuda" for GPU (faster), "cpu" for CPU
+    embedding_batch_size: int = 32  # 32 for GPU (VRAM limited), 32-64 for CPU
+    embedding_subprocess: bool = True  # Run in subprocess to fully release GPU memory after
     
     # Multi-pass matching thresholds
     # A candidate is included if ANY of these conditions are met:
@@ -121,7 +122,7 @@ class Config:
     llm_model: str = "qwen2.5:7b"  # Ollama model name
     
     # Output settings
-    output_dir: str = "."
+    output_dir: str = "./data"  # Directory for output files (candidates, matches, state.db)
     
     def __post_init__(self):
         if self.include_categories is None:
@@ -422,14 +423,19 @@ def get_cache_age_str(cache_path: str) -> str:
 # API FETCHING
 # =============================================================================
 
-def fetch_polymarket_markets() -> list[PolymarketMarket]:
-    """Fetch all active markets from Polymarket Gamma API"""
+def fetch_polymarket_markets(config: Config = None) -> list[PolymarketMarket]:
+    """Fetch all active markets from Polymarket Gamma API
+    
+    Note: We fetch all active markets and filter client-side so cache remains valid
+    across different filter configurations. API-level date filters could be added
+    but would require cache invalidation logic.
+    """
     print("Fetching Polymarket markets...")
     
     markets = []
     base_url = "https://gamma-api.polymarket.com/markets"
     offset = 0
-    limit = 500  # Increased from 100 - Gamma API supports up to 1000
+    limit = 500  # Gamma API supports up to 1000
     
     # Use session for connection reuse
     session = requests.Session()
@@ -438,6 +444,7 @@ def fetch_polymarket_markets() -> list[PolymarketMarket]:
         params = {
             "active": "true",
             "closed": "false",
+            "archived": "false",  # Skip archived markets
             "limit": limit,
             "offset": offset,
         }
@@ -512,8 +519,16 @@ def fetch_polymarket_markets() -> list[PolymarketMarket]:
     return markets
 
 
-def fetch_kalshi_markets() -> list[KalshiMarket]:
-    """Fetch all active markets from Kalshi API"""
+def fetch_kalshi_markets(config: Config = None) -> list[KalshiMarket]:
+    """Fetch all active markets from Kalshi API
+    
+    Note: Kalshi API has limited filtering options:
+    - Cannot filter by close time when status=open (API limitation)
+    - Cannot filter by volume/liquidity at API level
+    - Cannot filter by category at API level (only series_ticker)
+    
+    Most filtering must happen client-side after fetch.
+    """
     print("Fetching Kalshi markets...")
     
     markets = []
@@ -678,8 +693,9 @@ def filter_kalshi_markets(markets: list[KalshiMarket], config: Config) -> list[K
     # Print category summary
     cat_counts = {}
     for m in filtered:
-        cat_counts[m.category] = cat_counts.get(m.category, 0) + 1
-    if cat_counts:
+        cat = m.category if m.category else "(uncategorized)"
+        cat_counts[cat] = cat_counts.get(cat, 0) + 1
+    if cat_counts and not (len(cat_counts) == 1 and "(uncategorized)" in cat_counts):
         top_cats = sorted(cat_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         print(f"  Top Kalshi categories: {', '.join(f'{c}({n})' for c, n in top_cats)}")
     
@@ -689,6 +705,89 @@ def filter_kalshi_markets(markets: list[KalshiMarket], config: Config) -> list[K
 # =============================================================================
 # EMBEDDING & SIMILARITY
 # =============================================================================
+
+def compute_embeddings_subprocess(
+    poly_markets: list[PolymarketMarket],
+    kalshi_markets: list[KalshiMarket],
+    config: Config
+) -> dict:
+    """
+    Compute embeddings in a subprocess to ensure complete GPU memory release.
+    The subprocess exits after computing, freeing all CUDA context.
+    """
+    import tempfile
+    
+    print(f"Computing embeddings in subprocess (device={config.embedding_device})...")
+    
+    # Build texts
+    poly_titles = [build_title_text_polymarket(m) for m in poly_markets]
+    kalshi_titles = [build_title_text_kalshi(m) for m in kalshi_markets]
+    poly_full = [build_full_text_polymarket(m) for m in poly_markets]
+    kalshi_full = [build_full_text_kalshi(m) for m in kalshi_markets]
+    all_texts = poly_titles + kalshi_titles + poly_full + kalshi_full
+    
+    # Save texts to temp file
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pkl', delete=False) as f:
+        texts_path = f.name
+        pickle.dump(all_texts, f)
+    
+    embeddings_path = texts_path.replace('.pkl', '_emb.npy')
+    
+    # Create subprocess script
+    script = f'''
+import pickle
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+# Load texts
+with open("{texts_path}", "rb") as f:
+    texts = pickle.load(f)
+
+print(f"Loading model: {config.embedding_model}")
+model = SentenceTransformer("{config.embedding_model}", trust_remote_code=True, device="{config.embedding_device}")
+
+print(f"Computing {{len(texts)}} embeddings (batch_size={config.embedding_batch_size})...")
+embeddings = model.encode(texts, show_progress_bar=True, batch_size={config.embedding_batch_size})
+
+# Save embeddings
+np.save("{embeddings_path}", embeddings)
+print("Done - subprocess exiting, GPU memory will be fully released")
+'''
+    
+    # Run subprocess
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=False,  # Show progress bar
+        text=True
+    )
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"Embedding subprocess failed")
+    
+    # Load embeddings back
+    all_embeddings = np.load(embeddings_path)
+    
+    # Cleanup temp files
+    os.remove(texts_path)
+    os.remove(embeddings_path)
+    
+    # Split back into components
+    n_poly = len(poly_markets)
+    n_kalshi = len(kalshi_markets)
+    
+    idx = 0
+    poly_title_emb = all_embeddings[idx:idx+n_poly]; idx += n_poly
+    kalshi_title_emb = all_embeddings[idx:idx+n_kalshi]; idx += n_kalshi
+    poly_full_emb = all_embeddings[idx:idx+n_poly]; idx += n_poly
+    kalshi_full_emb = all_embeddings[idx:idx+n_kalshi]; idx += n_kalshi
+    
+    return {
+        "poly_title": poly_title_emb,
+        "kalshi_title": kalshi_title_emb,
+        "poly_full": poly_full_emb,
+        "kalshi_full": kalshi_full_emb,
+    }
+
 
 def compute_embeddings(
     poly_markets: list[PolymarketMarket],
@@ -1037,7 +1136,9 @@ def verify_candidates_incremental(
             skipped += 1
             continue
         
-        print(f"  Verifying {i+1}/{len(candidates)}: {candidate.poly_market.title[:50]}...")
+        print(f"  Verifying {i+1}/{len(candidates)}:")
+        print(f"    Poly:   {candidate.poly_market.title[:70]}")
+        print(f"    Kalshi: {candidate.kalshi_market.title[:70]}")
         
         is_match, confidence, reasoning = verify_with_llm(candidate, model)
         
@@ -1302,7 +1403,7 @@ def main():
         print(f"Exclude categories: {CONFIG.exclude_categories}")
     print()
     print(f"Embedding model: {CONFIG.embedding_model}")
-    print(f"Embedding device: {CONFIG.embedding_device}")
+    print(f"Embedding device: {CONFIG.embedding_device}" + (" (subprocess)" if CONFIG.embedding_subprocess else ""))
     if CONFIG.multi_pass_matching:
         print("Matching mode: Multi-pass")
         print(f"  Title-only threshold: {CONFIG.title_only_threshold}")
@@ -1320,6 +1421,9 @@ def main():
         print("MODE: Fresh fetch (ignoring cache)")
     print()
     
+    # Create output directory if needed
+    os.makedirs(CONFIG.output_dir, exist_ok=True)
+    
     # Initialize database
     db_path = os.path.join(CONFIG.output_dir, "state.db")
     conn = init_database(db_path)
@@ -1331,8 +1435,9 @@ def main():
     print(f"Previously processed candidates: {processed_count}")
     print()
     
-    date_str = utc_now().strftime("%Y-%m-%d")
-    candidates_filepath = os.path.join(CONFIG.output_dir, f"arb_candidates_{date_str}.csv")
+    now = utc_now()
+    datetime_str = now.strftime("%Y-%m-%d_%H%M%S")  # For filenames
+    candidates_filepath = os.path.join(CONFIG.output_dir, f"arb_candidates_{datetime_str}.csv")
     
     # Cache paths
     poly_cache_path = get_cache_path(CONFIG.cache_dir, "polymarket")
@@ -1407,14 +1512,30 @@ def main():
     else:
         # Normal mode: compute embeddings and find candidates
         
-        # Stop Ollama first to free GPU memory for embeddings
-        if CONFIG.embedding_device == "cuda":
-            stop_ollama_model(CONFIG.llm_model)
-        
         embed_start = time.time()
-        embeddings = compute_embeddings(
-            poly_filtered, kalshi_filtered, CONFIG
-        )
+        
+        if CONFIG.embedding_device == "cuda" and CONFIG.embedding_subprocess:
+            # Subprocess mode: embeddings run in separate process that exits cleanly
+            # No need to stop/reload Ollama - subprocess releases all GPU memory on exit
+            stop_ollama_model(CONFIG.llm_model)  # Stop to free VRAM for embeddings
+            embeddings = compute_embeddings_subprocess(
+                poly_filtered, kalshi_filtered, CONFIG
+            )
+            # Subprocess has exited - GPU memory is fully released
+            # Reload Ollama to get 100% GPU
+            reload_ollama_model(CONFIG.llm_model)
+        else:
+            # In-process mode (CPU or non-subprocess GPU)
+            if CONFIG.embedding_device == "cuda":
+                stop_ollama_model(CONFIG.llm_model)
+            
+            embeddings = compute_embeddings(
+                poly_filtered, kalshi_filtered, CONFIG
+            )
+            
+            if CONFIG.embedding_device == "cuda":
+                reload_ollama_model(CONFIG.llm_model)
+        
         embed_time = time.time() - embed_start
         print(f"Embeddings completed in {embed_time:.1f}s")
         print()
@@ -1432,10 +1553,6 @@ def main():
         
         # Save candidates CSV (pre-LLM)
         save_candidates_csv(candidates, candidates_filepath)
-        
-        # Reload Ollama to reclaim GPU memory freed from embeddings
-        if CONFIG.embedding_device == "cuda":
-            reload_ollama_model(CONFIG.llm_model)
     
     print()
     
@@ -1452,20 +1569,17 @@ def main():
     all_matches_filepath = os.path.join(CONFIG.output_dir, "arb_matches_all.csv")
     save_all_matches_csv(all_matches, all_matches_filepath)
     
-    # Also save today's new matches as separate file
-    todays_matches = [m for m in all_matches if m.get("match_date") == date_str]
-    if todays_matches:
-        new_matches_filepath = os.path.join(CONFIG.output_dir, f"arb_matches_{date_str}.csv")
-        df = pd.DataFrame(todays_matches)
-        df.to_csv(new_matches_filepath, index=False)
-        print(f"Saved {len(todays_matches)} matches from today to {new_matches_filepath}")
+    # Also save this run's matches as separate file
+    if verified_matches:
+        new_matches_filepath = os.path.join(CONFIG.output_dir, f"arb_matches_{datetime_str}.csv")
+        save_matches_csv(verified_matches, new_matches_filepath)
     
     conn.close()
     
     print()
     print("=" * 60)
     print("Pipeline complete!")
-    print(f"  Matches found today: {len(todays_matches)}")
+    print(f"  Matches found this run: {len(verified_matches)}")
     print(f"  Total matches all-time: {len(all_matches)}")
     print("=" * 60)
 
