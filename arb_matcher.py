@@ -1153,9 +1153,9 @@ def verify_candidates_incremental(
             save_single_match_to_db(conn, match)
             matches_this_run += 1
             
-            print(f"    ✓ Match confirmed (confidence: {confidence:.2f}) [Total: {matches_this_run}]")
+            print(f"    ✅ Match confirmed (confidence: {confidence:.2f}) [Total: {matches_this_run}]")
         else:
-            print(f"    ✗ Not a match: {reasoning[:50]}...")
+            print(f"    ❌ Not a match: {reasoning[:50]}... [Total: {matches_this_run}] ")
     
     print()
     if skipped > 0:
