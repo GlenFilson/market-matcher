@@ -32,9 +32,9 @@ ollama pull qwen2.5:7b
 ## Usage
 
 ```bash
-python arb_matcher.py              # normal run (uses cache if fresh)
-python arb_matcher.py --fresh      # force re-fetch from both APIs
-python arb_matcher.py --resume     # skip embeddings, resume LLM verification
+python -m arb_matcher              # normal run (uses cache if fresh)
+python -m arb_matcher --fresh      # force re-fetch from both APIs
+python -m arb_matcher --resume     # skip embeddings, resume LLM verification
 ```
 
 All progress is persisted to a SQLite database after every candidate, so it's safe to `Ctrl+C` and pick up where you left off with `--resume`.
@@ -56,9 +56,22 @@ All progress is persisted to a SQLite database after every candidate, so it's sa
 
 6. **Output** — Verified matches are written to timestamped CSVs and a cumulative `arb_matches_all.csv`. Each row includes prices from both venues and pre-computed arb spread columns.
 
+## Project Structure
+
+```
+arb_matcher/
+├── __main__.py       # CLI entry point and pipeline orchestration
+├── config.py         # Configuration dataclass and defaults
+├── models.py         # Market and match data models
+├── api.py            # Polymarket & Kalshi API clients with caching
+├── matching.py       # Filtering, embedding computation, candidate discovery
+├── verification.py   # LLM verification and Ollama GPU management
+└── db.py             # SQLite persistence and CSV I/O
+```
+
 ## Configuration
 
-All settings live in the `Config` dataclass at the top of `arb_matcher.py`:
+All settings live in the `Config` dataclass in `arb_matcher/config.py`:
 
 | Setting | Default | Description |
 |---|---|---|
