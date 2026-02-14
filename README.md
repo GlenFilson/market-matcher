@@ -1,113 +1,68 @@
-# Cross-Venue Arbitrage Market Matcher
+# Market Matcher
 
-Identifies matching prediction markets between Polymarket and Kalshi for potential arbitrage opportunities.
+Finds matching prediction markets between **Polymarket** and **Kalshi** and flags potential arbitrage opportunities.
 
-## Pipeline Overview
+## How It Works
 
-```
-1. Fetch active markets from both platforms (with caching)
-2. Apply filters (date, volume, liquidity, categories)
-3. Generate embeddings (local, sentence-transformers)
-4. Find candidate pairs via multi-pass similarity matching
-5. Save candidates CSV (for pipeline tuning)
-6. LLM verification of candidates (local, Ollama)
-7. Dedupe against previously identified pairs
-8. Output CSVs
+```mermaid
+flowchart TD
+    A[Fetch Markets] --> B[Filter]
+    B --> C[Compute Embeddings]
+    C --> D[Find Candidate Pairs]
+    D --> E[LLM Verification]
+    E --> F[Output CSVs]
+
+    A -- "Polymarket API\nKalshi API\n(cached)" --> B
+    B -- "date / volume\nliquidity / category" --> C
+    C -- "sentence-transformers\n(GPU or CPU)" --> D
+    D -- "multi-pass cosine\nsimilarity matching" --> E
+    E -- "Ollama local LLM\nconfirms real matches" --> F
+    F -- "candidates CSV\nmatches CSV\nstate.db" --> G[(Done)]
 ```
 
 ## Setup
 
-### 1. Install Python Dependencies
-
 ```bash
-cd arb_matcher
 pip install -r requirements.txt
-```
-
-### 2. Install Ollama (Local LLM)
-
-**Windows:** Download from https://ollama.ai/download
-
-**Linux:**
-```bash
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-**macOS:**
-```bash
-brew install ollama
-```
-
-### 3. Download the LLM Model
-
-```bash
+brew install ollama        # or https://ollama.ai/download
 ollama pull qwen2.5:7b
 ```
 
 ## Usage
 
-### Command Line Flags
-
-| Flag | Description |
-|------|-------------|
-| (none) | Normal run - uses cache if valid |
-| `--resume` | Resume LLM verification from candidates CSV |
-| `--fresh` | Force fresh API fetch, ignore cache |
-
 ```bash
-python arb_matcher.py              # Normal run
-python arb_matcher.py --resume     # Resume from where you left off
-python arb_matcher.py --fresh      # Force fresh API fetch
+python arb_matcher.py              # normal run (uses cache)
+python arb_matcher.py --fresh      # ignore cache, re-fetch from APIs
+python arb_matcher.py --resume     # resume LLM verification from last run
 ```
+
+Progress is saved after every candidate — safe to `Ctrl+C` and resume later.
 
 ## Configuration
 
-Edit the `CONFIG` section in `arb_matcher.py`:
+Edit the `Config` dataclass at the top of `arb_matcher.py`. Key knobs:
 
-```python
-# Cache settings
-cache_expiry_minutes: int = 60  # How long to use cached market data
+| Setting | Default | What it does |
+|---|---|---|
+| `days_until_max_end` | 30 | Only markets resolving within N days |
+| `polymarket_min_volume` | 5000 | Min volume filter |
+| `embedding_model` | `gte-large-en-v1.5` | Sentence-transformer model |
+| `embedding_device` | `cuda` | `cuda` for GPU, `cpu` for CPU |
+| `title_only_threshold` | 0.88 | Cosine sim for title-only match |
+| `llm_model` | `qwen2.5:7b` | Ollama model for verification |
 
-# Multi-pass matching thresholds
-title_only_threshold: float = 0.88
-full_text_threshold: float = 0.85
-title_with_date_threshold: float = 0.75
-max_date_difference_days: int = 3
+## Output
 
-# LLM model
-llm_model: str = "qwen2.5:7b"
-```
-
-## Output Files
+All output goes to `./data/`:
 
 | File | Description |
-|------|-------------|
+|---|---|
 | `arb_candidates_*.csv` | Pre-LLM candidate pairs |
-| `arb_matches_*.csv` | LLM-verified matches |
-| `arb_matches_all.csv` | Cumulative all matches |
-| `state.db` | SQLite match history |
-| `.cache/` | Cached market data |
+| `arb_matches_*.csv` | Confirmed matches per run |
+| `arb_matches_all.csv` | Cumulative match history |
+| `state.db` | SQLite state for dedup & resume |
 
-## Arbitrage Columns
+### Arb Columns
 
-| Column | Meaning |
-|--------|---------|
-| `pykn` | Poly YES + Kalshi NO - if < 1.0: buy YES poly, NO kalshi |
-| `kypn` | Kalshi YES + Poly NO - if < 1.0: buy YES kalshi, NO poly |
-
-## Resetting
-
-```bash
-rm state.db              # Clear match history
-rm -rf .cache            # Force fresh fetch
-rm arb_candidates_*.csv  # Re-run embeddings
-```
-
-## Performance
-
-| Stage | Fresh | Cached |
-|-------|-------|--------|
-| API fetch | ~6 min | ~2 sec |
-| Embeddings | ~40 sec | ~40 sec |
-| LLM (~700 candidates) | ~25 min | ~25 min |
-| **Total** | **~35 min** | **~30 min** |
+- **pykn** — Poly YES + Kalshi NO. If < 1.0 → buy YES on Poly, NO on Kalshi.
+- **kypn** — Kalshi YES + Poly NO. If < 1.0 → buy YES on Kalshi, NO on Poly.
