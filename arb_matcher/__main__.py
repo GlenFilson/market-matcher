@@ -117,9 +117,24 @@ def main():
 
     now = utc_now()
     datetime_str = now.strftime("%Y-%m-%d_%H%M%S")
-    candidates_filepath = os.path.join(
-        config.output_dir, f"arb_candidates_{datetime_str}.csv"
-    )
+    
+    # For resume mode, find the most recent candidates file
+    candidates_filepath = None
+    if resume_mode:
+        import glob
+        pattern = os.path.join(config.output_dir, "arb_candidates_*.csv")
+        candidates_files = glob.glob(pattern)
+        if candidates_files:
+            # Sort by modification time, most recent first
+            candidates_files.sort(key=os.path.getmtime, reverse=True)
+            candidates_filepath = candidates_files[0]
+            logger.info("Resume mode: found candidates file: %s", candidates_filepath)
+    
+    # If not resuming or no file found, create new one
+    if not candidates_filepath:
+        candidates_filepath = os.path.join(
+            config.output_dir, f"arb_candidates_{datetime_str}.csv"
+        )
 
     # --- Fetch or load from cache ---
 

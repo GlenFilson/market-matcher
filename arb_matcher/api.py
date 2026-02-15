@@ -7,7 +7,6 @@ from datetime import datetime
 
 import requests
 
-from .config import Config
 from .models import PolymarketMarket, KalshiMarket
 
 logger = logging.getLogger(__name__)
@@ -33,8 +32,21 @@ def save_to_cache(cache_path: str, data: list):
 
 
 def load_from_cache(cache_path: str) -> list:
-    with open(cache_path, "rb") as f:
-        return pickle.load(f)
+    """Load markets from cache, handling old cache format migration."""
+    try:
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+    except (AttributeError, ModuleNotFoundError) as e:
+        # Cache was saved with old structure - delete it and return empty list
+        logger.warning(
+            "Cache file has incompatible format (old structure). Deleting cache: %s", e
+        )
+        try:
+            import os
+            os.remove(cache_path)
+        except Exception:
+            pass
+        return []
 
 
 def get_cache_age_str(cache_path: str) -> str:
@@ -51,7 +63,7 @@ def get_cache_age_str(cache_path: str) -> str:
 
 # --- Polymarket ---
 
-def fetch_polymarket_markets(config: Config = None) -> list[PolymarketMarket]:
+def fetch_polymarket_markets() -> list[PolymarketMarket]:
     """Fetch all active markets from the Polymarket Gamma API."""
     logger.info("Fetching Polymarket markets...")
     markets = []
@@ -145,7 +157,7 @@ def fetch_polymarket_markets(config: Config = None) -> list[PolymarketMarket]:
 
 # --- Kalshi ---
 
-def fetch_kalshi_markets(config: Config = None) -> list[KalshiMarket]:
+def fetch_kalshi_markets() -> list[KalshiMarket]:
     """Fetch all active markets from the Kalshi trading API."""
     logger.info("Fetching Kalshi markets...")
     markets = []
