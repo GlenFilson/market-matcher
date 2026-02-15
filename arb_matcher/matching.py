@@ -104,26 +104,32 @@ def filter_kalshi_markets(
 
 # --- Embedding text construction ---
 
+# Hard character cap to prevent tokenizer from producing sequences longer than
+# the model's position-embedding table.  500 chars ≈ ~125 tokens, extremely conservative
+# to avoid CUDA index-out-of-bounds errors with custom model implementations.
+_MAX_TEXT_CHARS = 500
+
+
 def _title_text_polymarket(market: PolymarketMarket) -> str:
-    return market.title
+    return market.title[:_MAX_TEXT_CHARS]
 
 
 def _title_text_kalshi(market: KalshiMarket) -> str:
-    return market.title
+    return market.title[:_MAX_TEXT_CHARS]
 
 
 def _full_text_polymarket(market: PolymarketMarket) -> str:
     parts = [market.title, market.description or ""]
     if market.end_date:
         parts.append(f"Resolves: {market.end_date.strftime('%Y-%m-%d')}")
-    return " ".join(p for p in parts if p).strip()
+    return " ".join(p for p in parts if p).strip()[:_MAX_TEXT_CHARS]
 
 
 def _full_text_kalshi(market: KalshiMarket) -> str:
     parts = [market.title, market.subtitle or "", market.rules or ""]
     if market.end_date:
         parts.append(f"Resolves: {market.end_date.strftime('%Y-%m-%d')}")
-    return " ".join(p for p in parts if p).strip()
+    return " ".join(p for p in parts if p).strip()[:_MAX_TEXT_CHARS]
 
 
 # --- Embedding computation ---
@@ -161,12 +167,26 @@ with open("{texts_path}", "rb") as f:
     texts = pickle.load(f)
 
 print(f"Loading model: {config.embedding_model}")
+# Standard models don't need trust_remote_code=True
 model = SentenceTransformer(
-    "{config.embedding_model}", trust_remote_code=True, device="{config.embedding_device}"
+    "{config.embedding_model}", device="{config.embedding_device}"
 )
 
-print(f"Computing {{len(texts)}} embeddings (batch_size={config.embedding_batch_size})...")
-embeddings = model.encode(texts, show_progress_bar=True, batch_size={config.embedding_batch_size})
+# Standard models handle truncation properly, use model's max_seq_length
+safe_max = model.max_seq_length
+print(f"Using model's max_seq_length: {{safe_max}}")
+
+# Standard models handle truncation properly - just use the texts as-is
+print(f"Computing embeddings for {{len(texts)}} texts...")
+
+print(f"Computing embeddings (batch_size={config.embedding_batch_size}, max_seq={{safe_max}})...")
+embeddings = model.encode(
+    texts,
+    show_progress_bar=True,
+    batch_size={config.embedding_batch_size},
+    convert_to_numpy=True,
+    normalize_embeddings=False,
+)
 
 np.save("{embeddings_path}", embeddings)
 print("Done - subprocess exiting, GPU memory will be fully released")
@@ -199,8 +219,16 @@ def compute_embeddings(
     logger.info("Loading embedding model: %s", config.embedding_model)
     logger.info("Embedding device: %s", config.embedding_device)
     model = SentenceTransformer(
-        config.embedding_model, trust_remote_code=True, device=config.embedding_device
+        config.embedding_model, device=config.embedding_device
     )
+    
+    # Standard models handle truncation properly
+    safe_max = model.max_seq_length
+    logger.info("Using model's max_seq_length: %d", safe_max)
+    
+    model.max_seq_length = safe_max
+    if hasattr(model.tokenizer, "model_max_length"):
+        model.tokenizer.model_max_length = safe_max
 
     logger.info("Building embedding texts...")
 
@@ -211,13 +239,21 @@ def compute_embeddings(
 
     all_texts = poly_titles + kalshi_titles + poly_full + kalshi_full
 
+    # Standard models handle truncation properly - no manual truncation needed
+    logger.info("Computing embeddings for %d texts...", len(all_texts))
+
     logger.info(
-        "Computing embeddings for %d texts (batch_size=%d)...",
+        "Computing embeddings for %d texts (batch_size=%d, max_seq=%d)...",
         len(all_texts),
         config.embedding_batch_size,
+        safe_max,
     )
     all_embeddings = model.encode(
-        all_texts, show_progress_bar=True, batch_size=config.embedding_batch_size
+        all_texts,
+        show_progress_bar=True,
+        batch_size=config.embedding_batch_size,
+        convert_to_numpy=True,
+        normalize_embeddings=False,
     )
 
     logger.info("Freeing embedding model memory...")
@@ -274,7 +310,10 @@ def find_candidates(
     )
 
     def normalize(emb):
-        return emb / np.linalg.norm(emb, axis=1, keepdims=True)
+        norms = np.linalg.norm(emb, axis=1, keepdims=True)
+        # Avoid division by zero (shouldn't happen with real embeddings, but be safe)
+        norms = np.where(norms == 0, 1.0, norms)
+        return emb / norms
 
     poly_title_norm = normalize(embeddings["poly_title"])
     kalshi_title_norm = normalize(embeddings["kalshi_title"])

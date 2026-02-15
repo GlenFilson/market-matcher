@@ -41,7 +41,8 @@ class Config:
     max_date_difference_days: int = 3
 
     # Embedding model (sentence-transformers)
-    embedding_model: str = "Alibaba-NLP/gte-large-en-v1.5"
+    # Using all-mpnet-base-v2 instead of gte-large-en-v1.5 to avoid custom embedding layer bugs
+    embedding_model: str = "sentence-transformers/all-mpnet-base-v2"
     embedding_device: str = "cuda"
     embedding_batch_size: int = 32
     embedding_subprocess: bool = True
